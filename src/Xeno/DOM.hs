@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
 
 -- | DOM parser and API for XML.
 
@@ -116,15 +117,19 @@ name (Node str start offsets) =
     0x00 -> substring str (offsets ! (start + 2)) (offsets ! (start + 3))
     _ -> mempty
 
+growV = UMV.grow
+lengthV = UMV.length
+readV = UMV.read
+writeV = UMV.write
+
 -- | Parse a complete Nodes document.
+--   Returns a nameless root node containing the tree for the document.
 parse :: ByteString -> Either XenoException Node
 parse str =
   case spork node of
     Left e -> Left e
     Right r ->
-      case r ! 0 of
-        0x00 -> Right (Node str 0 r)
-        _ -> Left XenoExpectRootNode
+  	Right (Node str 0 r)
   where
     node =
       runST
@@ -132,66 +137,57 @@ parse str =
             vecRef <- newSTRef nil
             sizeRef <- fmap asURef (newRef 0)
             parentRef <- fmap asURef (newRef 0)
+            let demand n index = do
+                  v <- readSTRef vecRef
+                  if index + n < lengthV v
+                    then pure v
+                    else do
+                      v' <- growV v (lengthV v)
+                      writeSTRef vecRef v'
+                      return v'
+            let writeNode index v' tag tag_parent name_start name_len tag_end =
+                 do writeV v' index tag
+                    writeV v' (index + 1) tag_parent
+                    writeV v' (index + 2) name_start
+                    writeV v' (index + 3) name_len
+                    writeV v' (index + 4) tag_end
+                    writeRef sizeRef (index + 5)
+                    writeRef parentRef index
+            -- insert the synthetic root node
+            writeNode 0 nil 0 0 0 0 (-1)
             process
               (\(PS _ name_start name_len) -> do
                  let tag = 0x00
                      tag_end = -1
                  index <- readRef sizeRef
-                 v' <-
-                   do v <- readSTRef vecRef
-                      if index + 5 < UMV.length v
-                        then pure v
-                        else do
-                          v' <- UMV.grow v (UMV.length v)
-                          writeSTRef vecRef v'
-                          return v'
+                 v' <- demand 5 index
                  tag_parent <- readRef parentRef
-                 do writeRef parentRef index
-                    writeRef sizeRef (index + 5)
-                 do UMV.write v' index tag
-                    UMV.write v' (index + 1) tag_parent
-                    UMV.write v' (index + 2) name_start
-                    UMV.write v' (index + 3) name_len
-                    UMV.write v' (index + 4) tag_end)
+                 writeNode index v' tag tag_parent name_start name_len tag_end)
               (\(PS _ key_start key_len) (PS _ value_start value_len) -> do
                  index <- readRef sizeRef
-                 v' <-
-                   do v <- readSTRef vecRef
-                      if index + 5 < UMV.length v
-                        then pure v
-                        else do
-                          v' <- UMV.grow v (UMV.length v)
-                          writeSTRef vecRef v'
-                          return v'
+                 v' <- demand 5 index
                  let tag = 0x02
                  do writeRef sizeRef (index + 5)
-                 do UMV.write v' index tag
-                    UMV.write v' (index + 1) key_start
-                    UMV.write v' (index + 2) key_len
-                    UMV.write v' (index + 3) value_start
-                    UMV.write v' (index + 4) value_len)
+                 do writeV v' index tag
+                    writeV v' (index + 1) key_start
+                    writeV v' (index + 2) key_len
+                    writeV v' (index + 3) value_start
+                    writeV v' (index + 4) value_len)
               (\_ -> return ())
               (\(PS _ text_start text_len) -> do
                  let tag = 0x01
                  index <- readRef sizeRef
-                 v' <-
-                   do v <- readSTRef vecRef
-                      if index + 3 < UMV.length v
-                        then pure v
-                        else do
-                          v' <- UMV.grow v (UMV.length v)
-                          writeSTRef vecRef v'
-                          return v'
+                 v' <- demand 3 index
                  do writeRef sizeRef (index + 3)
-                 do UMV.write v' index tag
-                    UMV.write v' (index + 1) text_start
-                    UMV.write v' (index + 2) text_len)
+                 do writeV v' index tag
+                    writeV v' (index + 1) text_start
+                    writeV v' (index + 2) text_len)
               (\_ -> do
                  v <- readSTRef vecRef
                  -- Set the tag_end slot of the parent.
                  parent <- readRef parentRef
                  index <- readRef sizeRef
-                 UMV.write v (parent + 4) index
+                 writeV v (parent + 4) index
                  -- Pop the stack and return to the parent element.
                  previousParent <- UMV.read v (parent + 1)
                  writeRef parentRef previousParent)
@@ -199,6 +195,8 @@ parse str =
             wet <- readSTRef vecRef
             arr <- UV.unsafeFreeze wet
             size <- readRef sizeRef
+            -- set the tag_end slot of the root node
+            writeV wet 4 size
             return (UV.unsafeSlice 0 size arr))
 
 -- | Get a substring of the BS.
